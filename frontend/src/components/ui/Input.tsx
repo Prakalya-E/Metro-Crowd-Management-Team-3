@@ -128,30 +128,3 @@ const Input = React.forwardRef<HTMLInputElement, InputProps>(
 Input.displayName = "Input";
 
 export default Input;
-
-/* ---------------- Example Usage ----------------
-
-import { Search } from "lucide-react";
-
-<Input
-  label="Email"
-  placeholder="Enter email"
-/>
-
-<Input
-  type="password"
-  label="Password"
-/>
-
-<Input
-  label="Search Station"
-  startIcon={<Search size={18} />}
-  placeholder="Rajiv Chowk"
-/>
-
-<Input
-  label="Email"
-  error="Invalid email address"
-/>
-
------------------------------------------------- */

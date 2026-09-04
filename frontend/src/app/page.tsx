@@ -78,8 +78,6 @@ export default function HomePage() {
 
     <main className="site-shell">
 
-      {/* ================= NAVBAR ================= */}
-
       <nav className="site-nav">
 
         <Link
@@ -156,8 +154,6 @@ export default function HomePage() {
         </div>
 
       </nav>
-
-      {/* ================= HERO ================= */}
 
       <section className="home-hero">
 
@@ -305,7 +301,6 @@ export default function HomePage() {
         </div>
 
       </section>
-            {/* ================= NETWORK STRIP ================= */}
 
       <section className="network-strip">
 
@@ -374,8 +369,6 @@ export default function HomePage() {
         </div>
 
       </section>
-
-      {/* ================= STORY ================= */}
 
       <section
         className="story-section"
@@ -485,8 +478,6 @@ export default function HomePage() {
 
       </section>
 
-      {/* ================= CAPABILITIES ================= */}
-
       <section
         className="capabilities-section"
         id="platform"
@@ -594,7 +585,6 @@ export default function HomePage() {
         </div>
 
       </section>
-            {/* ================= IMPACT ================= */}
 
       <section
         className="impact-section"
@@ -711,8 +701,6 @@ export default function HomePage() {
 
       </section>
 
-      {/* ================= CTA ================= */}
-
       <section className="final-cta">
 
         <div>
@@ -747,8 +735,6 @@ export default function HomePage() {
         </Link>
 
       </section>
-
-      {/* ================= FOOTER ================= */}
 
       <footer className="site-footer">
 

@@ -1,118 +1,27 @@
-// "use client";
-
-// import { Bell, Search } from "lucide-react";
-
-// import ThemeToggle from "./ThemeToggle";
-// import Input from "@/components/ui/Input";
-
-// export default function Header() {
-//   return (
-//     <header
-//       className="
-//       sticky
-//       top-0
-//       z-40
-//       border-b
-//       border-border
-//       bg-background/80
-//       backdrop-blur-xl
-//       "
-//     >
-
-//       <div className="container-custom">
-
-//         <div className="flex h-20 items-center justify-between">
-
-//           <div className="w-[420px]">
-
-//             <Input
-//               placeholder="Search station, train..."
-//               startIcon={<Search size={18} />}
-//             />
-
-//           </div>
-
-//           <div className="flex items-center gap-4">
-
-//             <button
-//               className="
-//               relative
-//               flex
-//               h-11
-//               w-11
-//               items-center
-//               justify-center
-//               rounded-xl
-//               border
-//               border-border
-//               bg-card
-//               transition
-//               hover:border-primary
-//               "
-//             >
-
-//               <Bell size={20} />
-
-//               <span
-//                 className="
-//                 absolute
-//                 right-2
-//                 top-2
-//                 h-2
-//                 w-2
-//                 rounded-full
-//                 bg-red-500
-//                 "
-//               />
-
-//             </button>
-
-//             <ThemeToggle />
-
-//             <div className="flex items-center gap-3">
-
-//               <img
-//                 src="https://i.pravatar.cc/150?img=15"
-//                 className="h-11 w-11 rounded-full"
-//               />
-
-//               <div>
-
-//                 <h3 className="font-semibold">
-//                   Shubham Kumar
-//                 </h3>
-
-//                 <p className="text-xs text-muted">
-//                   Administrator
-//                 </p>
-
-//               </div>
-
-//             </div>
-
-//           </div>
-
-//         </div>
-
-//       </div>
-
-//     </header>
-//   );
-// }
 
 "use client";
 
+import { useMemo, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useState } from "react";
 import {
   Bell,
   Search,
   UserCircle2,
   PanelLeft,
+  X,
 } from "lucide-react";
 import ThemeToggle from "./ThemeToggle";
-import { createClient } from "@/lib/supabase/client";
+import StateSelector from "./StateSelector";
+import { useAuth } from "@/providers/AuthProvider";
+import { useApiData } from "@/hooks/useApiData";
+import { getStations } from "@/lib/api/stations";
+import { queryKeys } from "@/lib/queryKeys";
+import { useFocusedStation } from "@/providers/FocusedStationProvider";
+import { useSelectedState } from "@/providers/StateProvider";
+import LiveStatusBadge from "@/components/dashboard/LiveStatusBadge";
+import { getUnreadCount } from "@/lib/api/notifications";
+import { useLiveSocket } from "@/hooks/useLiveSocket";
 
 interface HeaderProps {
   title?: string;
@@ -126,29 +35,73 @@ export default function Header({
   onMenuClick,
 }: HeaderProps) {
   const pathname = usePathname();
-  const [userName, setUserName] = useState("Metro User");
-  const [role, setRole] = useState("Passenger");
+  const { profile } = useAuth();
+  const { setSelectedState, selectedState } = useSelectedState();
+  const { focusedStation, setFocusedStation } = useFocusedStation();
 
-  useEffect(() => {
-    const supabase = createClient();
+  const { data: allStations } = useApiData(
+    queryKeys.stations,
+    (signal) => getStations(undefined, undefined, signal),
+    [],
+  );
+  const [query, setQuery] = useState("");
 
-    supabase.auth.getUser().then(({ data }) => {
-      const user = data.user;
-      const metadata = user?.user_metadata;
-      const appRole =
-        user?.app_metadata?.role ??
-        metadata?.requested_role ??
-        "passenger";
+  // Slow fallback poll - the live socket subscription below normally
+  // keeps the badge current instantly, this just re-syncs periodically
+  // in case an event was missed (e.g. connection was down).
+  const { data: unreadData } = useApiData(
+    queryKeys.notificationsUnreadCount,
+    (signal) => getUnreadCount(signal, selectedState ?? undefined),
+    [selectedState],
+    120000,
+  );
 
-      setUserName(
-        metadata?.full_name ??
-          metadata?.name ??
-          user?.email?.split("@")[0] ??
-          "Metro User",
-      );
-      setRole(String(appRole));
+  // Track live deltas on top of the last poll result, reset whenever
+  // a fresh poll result comes in (adjusting state in response to a
+  // prop/data change during render, not inside an effect - see
+  // https://react.dev/learn/you-might-not-need-an-effect).
+  const [prevUnreadData, setPrevUnreadData] = useState(unreadData);
+  const [liveDelta, setLiveDelta] = useState(0);
+  if (unreadData !== prevUnreadData) {
+    setPrevUnreadData(unreadData);
+    setLiveDelta(0);
+  }
+  const unreadCount = Math.max(0, (unreadData?.unread ?? 0) + liveDelta);
+
+  useLiveSocket({
+    notification: (payload) => {
+      const matchesState = !payload.state || !selectedState || payload.state === selectedState;
+      if (matchesState) setLiveDelta((d) => d + 1);
+    },
+    notification_read: () => setLiveDelta((d) => d - 1),
+    notification_all_read: () => setLiveDelta(-(unreadData?.unread ?? 0)),
+  });
+
+  const matches = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return [];
+    return (allStations ?? [])
+      .filter((s) => s.station_name.toLowerCase().includes(q))
+      .slice(0, 8);
+  }, [allStations, query]);
+
+  function pickStation(station: NonNullable<typeof allStations>[number]) {
+    setFocusedStation({
+      id: station.id,
+      name: station.station_name,
+      city: station.city,
+      latitude: station.latitude,
+      longitude: station.longitude,
+      line_name: station.line_name,
+      line_color: station.line_color,
+      station_order: station.station_order,
     });
-  }, []);
+    setSelectedState(station.city);
+    setQuery("");
+  }
+
+  const userName = profile?.full_name ?? "Metro User";
+  const role = profile?.role ?? "passenger";
 
   const pageName = pathname
     .split("/")
@@ -188,32 +141,87 @@ export default function Header({
 
         </div>
 
-        <div className="hidden w-full max-w-sm items-center rounded-2xl border border-border bg-card px-4 xl:flex">
+        <div className="relative hidden w-full max-w-sm xl:block">
 
-          <Search
-            size={18}
-            className="text-muted"
-          />
+          {focusedStation ? (
+            <div className="flex h-12 items-center justify-between rounded-2xl border border-primary/40 bg-primary/10 px-4 text-sm font-semibold">
+              <span className="truncate">
+                Focused: {focusedStation.name}
+              </span>
+              <button
+                type="button"
+                onClick={() => setFocusedStation(null)}
+                title="Clear focus - show every station again"
+                className="ml-2 shrink-0 text-muted hover:text-foreground"
+              >
+                <X size={16} />
+              </button>
+            </div>
+          ) : (
+            <div className="flex items-center rounded-2xl border border-border bg-card px-4">
 
-          <input
-            type="text"
-            placeholder="Search stations, trains..."
-            className="h-12 w-full bg-transparent px-3 text-sm outline-none"
-          />
+              <Search
+                size={18}
+                className="text-muted"
+              />
+
+              <input
+                type="text"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search your station..."
+                className="h-12 w-full bg-transparent px-3 text-sm outline-none"
+              />
+
+            </div>
+          )}
+
+          {matches.length > 0 && (
+            <ul className="absolute z-50 mt-2 w-full overflow-hidden rounded-2xl border border-border bg-card shadow-xl">
+              {matches.map((s) => (
+                <li key={s.id}>
+                  <button
+                    type="button"
+                    onClick={() => pickStation(s)}
+                    className="flex w-full items-center justify-between px-4 py-2.5 text-left text-sm hover:bg-muted"
+                  >
+                    <span className="font-medium">{s.station_name}</span>
+                    <span className="text-xs text-muted">{s.city}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
 
         </div>
 
         <div className="flex items-center gap-4">
 
+          {
+
+}
+          <div className="hidden sm:block">
+            <LiveStatusBadge />
+          </div>
+
+          <StateSelector />
+
           <ThemeToggle />
 
-          <button className="relative rounded-2xl border border-border p-3 transition hover:bg-muted">
+          <Link
+            href="/notifications"
+            className="relative rounded-2xl border border-border p-3 transition hover:bg-muted"
+          >
 
             <Bell size={20} />
 
-            <span className="absolute right-2 top-2 h-2.5 w-2.5 rounded-full bg-red-500" />
+            {unreadCount > 0 && (
+              <span className="absolute right-1 top-1 flex h-5 min-w-[20px] items-center justify-center rounded-full bg-red-500 px-1.5 text-[10px] font-bold leading-none text-white">
+                {unreadCount > 99 ? "99+" : unreadCount}
+              </span>
+            )}
 
-          </button>
+          </Link>
 
           <Link
             href="/profile"

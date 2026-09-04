@@ -1,74 +1,45 @@
-// src/components/dashboard/CrowdHeatMap.tsx
-
 "use client";
 
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Users,
   Activity,
   AlertTriangle,
   Info,
+  Radio,
 } from "lucide-react";
 
-interface HeatPoint {
-  id: number;
-  station: string;
-  x: number;
-  y: number;
-  occupancy: number;
-  passengers: number;
-}
+import { useApiData } from "@/hooks/useApiData";
+import { useLiveSocket } from "@/hooks/useLiveSocket";
+import { useLiveSocketContext } from "@/providers/LiveSocketProvider";
+import { useStations } from "@/hooks/useStations";
+import { useStationRoute } from "@/hooks/useStationRoute";
+import { useFullscreen } from "@/hooks/useFullscreen";
+import MapFullscreenToggle from "@/components/dashboard/MapFullscreenToggle";
+import SimulatorToggle from "@/components/dashboard/SimulatorToggle";
+import LiveLocationPanel from "@/components/dashboard/LiveLocationPanel";
+import { buildLineSegments } from "@/lib/mapLines";
+import { getCrowdHeatmap } from "@/lib/api/crowd";
+import { getRecommendations } from "@/lib/api/predictions";
+import { useSelectedState } from "@/providers/StateProvider";
+import { useFocusedStation } from "@/providers/FocusedStationProvider";
+import { queryKeys } from "@/lib/queryKeys";
+import type { CrowdHeatmapPoint, CrowdLevel, SmartRecommendation } from "@/lib/api/types";
 
-const stations: HeatPoint[] = [
-  {
-    id: 1,
-    station: "Rajiv Chowk",
-    x: 48,
-    y: 26,
-    occupancy: 96,
-    passengers: 18250,
-  },
-  {
-    id: 2,
-    station: "Kashmere Gate",
-    x: 62,
-    y: 14,
-    occupancy: 84,
-    passengers: 13620,
-  },
-  {
-    id: 3,
-    station: "Central Secretariat",
-    x: 61,
-    y: 41,
-    occupancy: 68,
-    passengers: 9420,
-  },
-  {
-    id: 4,
-    station: "Noida Sector 18",
-    x: 82,
-    y: 71,
-    occupancy: 58,
-    passengers: 7210,
-  },
-  {
-    id: 5,
-    station: "Dwarka",
-    x: 12,
-    y: 82,
-    occupancy: 34,
-    passengers: 4120,
-  },
-  {
-    id: 6,
-    station: "Botanical Garden",
-    x: 92,
-    y: 82,
-    occupancy: 74,
-    passengers: 10510,
-  },
-];
+const DEFAULT_NEARBY_COUNT = 15;
+const NEARBY_COUNT_OPTIONS = [10, 15, 20] as const;
+
+function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number) {
+  const R = 6371;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
 
 function getColor(value: number) {
   if (value >= 90) return "#ef4444";
@@ -81,9 +52,207 @@ function getSize(value: number) {
   return value / 4 + 16;
 }
 
-export default function CrowdHeatMap() {
-  const [selected, setSelected] =
-    useState<HeatPoint | null>(stations[0]);
+function dedupeByStationName(points: CrowdHeatmapPoint[]) {
+  // Interchange stations can come back as two rows with the same
+  // station_name (one per metro line) - keep only the busier one so
+  // the map never draws the same station label twice.
+  const byName = new Map<string, CrowdHeatmapPoint>();
+  for (const p of points) {
+    const key = p.station_name.trim().toLowerCase();
+    const existing = byName.get(key);
+    if (!existing || p.occupancy_ratio > existing.occupancy_ratio) {
+      byName.set(key, p);
+    }
+  }
+  return Array.from(byName.values());
+}
+
+function projectPositions(points: CrowdHeatmapPoint[]) {
+  const valid = dedupeByStationName(points).filter(
+    (p) =>
+      Number.isFinite(p.latitude) &&
+      Number.isFinite(p.longitude) &&
+      !(p.latitude === 0 && p.longitude === 0),
+  );
+
+  if (valid.length === 0) return [];
+
+  const lats = valid.map((p) => p.latitude);
+  const lngs = valid.map((p) => p.longitude);
+  const minLat = Math.min(...lats);
+  const maxLat = Math.max(...lats);
+  const minLng = Math.min(...lngs);
+  const maxLng = Math.max(...lngs);
+  const latRange = maxLat - minLat || 1;
+  const lngRange = maxLng - minLng || 1;
+
+  return valid.map((point) => ({
+    ...point,
+    x: ((point.longitude - minLng) / lngRange) * 80 + 10,
+    y: ((maxLat - point.latitude) / latRange) * 80 + 10,
+  }));
+}
+
+export default function CrowdHeatMap({
+  onSelectStation,
+  trainRouteStationIds,
+  preferredStationId,
+}: {
+  onSelectStation?: (station: { id: number; name: string } | null) => void;
+  /** When set (e.g. viewing a single train), scope the heat map to exactly
+   * these station ids - the train's own route - instead of the generic
+   * focused-station/line lookup, which depends on that station's line_name
+   * being populated and can silently fall back to "all stations". */
+  trainRouteStationIds?: number[] | null;
+  /** Station to auto-select by default when trainRouteStationIds is set. */
+  preferredStationId?: number | null;
+} = {}) {
+  const { selectedState } = useSelectedState();
+  const [topBusiestOnly, setTopBusiestOnly] = useState(false);
+  const TOP_N = 20;
+  const { focusedStation, liveLocationOn } = useFocusedStation();
+  const { isConnected } = useLiveSocketContext();
+
+  const explicitTrainRouteIds = useMemo(
+    () =>
+      trainRouteStationIds && trainRouteStationIds.length > 0
+        ? new Set(trainRouteStationIds)
+        : null,
+    [trainRouteStationIds],
+  );
+
+  const { data, loading, error } = useApiData(
+    queryKeys.crowdHeatmap,
+    (signal) =>
+      getCrowdHeatmap(
+        selectedState ?? undefined,
+        topBusiestOnly && !focusedStation && !explicitTrainRouteIds ? TOP_N : undefined,
+        signal,
+      ),
+    [selectedState, topBusiestOnly, focusedStation, explicitTrainRouteIds],
+    isConnected ? 0 : 30000,
+  );
+
+  const { data: allStationsForRoute } = useStations();
+  const { routeStations, lineName } = useStationRoute(
+    allStationsForRoute,
+    focusedStation,
+    liveLocationOn,
+  );
+  const routeStationIds = useMemo(
+    () => new Set(routeStations.map((s) => s.id)),
+    [routeStations],
+  );
+
+  const [liveById, setLiveById] = useState<
+    Record<number, { current_count: number; crowd_level: CrowdLevel }>
+  >({});
+  const [connected, setConnected] = useState(false);
+
+  useLiveSocket({
+    crowd_update: (payload) => {
+      setConnected(true);
+      
+      setLiveById((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const u of payload.updates) {
+          const existing = prev[u.station_id];
+          if (
+            existing &&
+            existing.current_count === u.current_count &&
+            existing.crowd_level === u.crowd_level
+          ) {
+            continue;
+          }
+          changed = true;
+          next[u.station_id] = {
+            current_count: u.current_count,
+            crowd_level: u.crowd_level as CrowdLevel,
+          };
+        }
+        return changed ? next : prev;
+      });
+    },
+  });
+
+  const merged = useMemo(() => {
+    return (data ?? []).map((point) => {
+      const live = liveById[point.station_id];
+      if (!live) return point;
+      const occupancy_ratio = point.capacity
+        ? live.current_count / point.capacity
+        : point.occupancy_ratio;
+      return {
+        ...point,
+        current_count: live.current_count,
+        crowd_level: live.crowd_level,
+        occupancy_ratio,
+      };
+    });
+  }, [data, liveById]);
+
+  const [nearbyCount, setNearbyCount] = useState<number>(DEFAULT_NEARBY_COUNT);
+
+  const nearby = useMemo(() => {
+    if (explicitTrainRouteIds) {
+      return merged.filter((p) => explicitTrainRouteIds.has(p.station_id));
+    }
+
+    if (!focusedStation) return merged;
+
+    if (liveLocationOn && lineName) {
+      return merged.filter((p) => routeStationIds.has(p.station_id));
+    }
+
+    return [...merged]
+      .sort(
+        (a, b) =>
+          haversineKm(focusedStation.latitude, focusedStation.longitude, a.latitude, a.longitude) -
+          haversineKm(focusedStation.latitude, focusedStation.longitude, b.latitude, b.longitude),
+      )
+      .slice(0, nearbyCount);
+  }, [
+    merged,
+    focusedStation,
+    nearbyCount,
+    liveLocationOn,
+    lineName,
+    routeStationIds,
+    explicitTrainRouteIds,
+  ]);
+
+  const positioned = useMemo(() => projectPositions(nearby), [nearby]);
+  const lineSegments = useMemo(() => buildLineSegments(positioned), [positioned]);
+
+  const { ref: fullscreenRef, isFullscreen, toggleFullscreen } = useFullscreen<HTMLDivElement>();
+  
+  const showAllLabels = true;
+  const [hoveredId, setHoveredId] = useState<number | null>(null);
+
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [recommendations, setRecommendations] = useState<SmartRecommendation[]>([]);
+
+  // Default selection when nothing's been clicked yet: prefer the train's
+  // relevant station when we're scoped to one train's route, otherwise
+  // fall back to the first station currently on the map.
+  const routeFallbackStationId = explicitTrainRouteIds ? preferredStationId ?? null : null;
+  const effectiveSelectedId =
+    selectedId ?? routeFallbackStationId ?? positioned[0]?.station_id ?? null;
+  const selected = positioned.find((p) => p.station_id === effectiveSelectedId);
+
+  useEffect(() => {
+    onSelectStation?.(
+      selected ? { id: selected.station_id, name: selected.station_name } : null,
+    );
+  }, [selected?.station_id]);
+
+  useEffect(() => {
+    if (!selected) return;
+    getRecommendations(selected.station_id)
+      .then(setRecommendations)
+      .catch(() => setRecommendations([]));
+  }, [selected?.station_id]);
 
   return (
     <section className="rounded-3xl border border-border bg-card p-8">
@@ -96,145 +265,218 @@ export default function CrowdHeatMap() {
             Crowd Heat Map
           </h2>
 
-          <p className="mt-2 text-muted">
-            Live passenger density across stations
+          <p className="mt-2 flex flex-wrap items-center gap-2 text-muted">
+            {explicitTrainRouteIds ? (
+              <span>This train&apos;s route - {positioned.length} stations</span>
+            ) : liveLocationOn && lineName ? (
+              <span>
+                Your real track on {lineName} - {positioned.length} stations
+              </span>
+            ) : focusedStation ? (
+              <>
+                <span>
+                  Nearest {Math.min(nearbyCount, positioned.length)} stations around{" "}
+                  {focusedStation.name}
+                </span>
+                <select
+                  value={nearbyCount}
+                  onChange={(e) => setNearbyCount(Number(e.target.value))}
+                  className="rounded-lg border border-border bg-background px-2 py-1 text-xs font-semibold text-foreground"
+                  title="How many nearby stations to show"
+                >
+                  {NEARBY_COUNT_OPTIONS.map((n) => (
+                    <option key={n} value={n}>
+                      Show {n}
+                    </option>
+                  ))}
+                </select>
+              </>
+            ) : (
+              "Live passenger density across stations"
+            )}
           </p>
 
         </div>
 
-        <div className="rounded-xl bg-primary/10 p-3">
+        <div className="flex items-center gap-3">
 
-          <Activity
-            className="text-primary"
-            size={28}
-          />
+          <button
+            type="button"
+            onClick={() => setTopBusiestOnly((v) => !v)}
+            disabled={!!focusedStation || !!explicitTrainRouteIds}
+            title={
+              focusedStation || explicitTrainRouteIds
+                ? "Not applied while searching a station - clear the search to use this filter"
+                : undefined
+            }
+            className={`
+            rounded-full
+            px-4
+            py-1.5
+            text-xs
+            font-semibold
+            transition
+            disabled:cursor-not-allowed
+            disabled:opacity-40
+            ${
+              topBusiestOnly
+                ? "bg-primary text-white"
+                : "bg-background text-muted hover:text-foreground"
+            }
+            `}
+          >
+            {topBusiestOnly ? `Top ${TOP_N} Busiest` : "All Stations"}
+          </button>
+
+          <SimulatorToggle />
+
+          {connected && (
+            <span className="flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-500">
+              <Radio size={12} className="animate-pulse" />
+              Live
+            </span>
+          )}
+
+          <div className="rounded-xl bg-primary/10 p-3">
+
+            <Activity
+              className="text-primary"
+              size={28}
+            />
+
+          </div>
 
         </div>
 
       </div>
 
-      <div className="grid gap-8 xl:grid-cols-3">
+      {error && (
+        <p className="mb-6 rounded-xl bg-red-500/10 p-3 text-sm text-red-500">{error}</p>
+      )}
 
-        {/* Heat Map */}
+      {loading ? (
+        <p className="text-sm text-muted">Loading live crowd data...</p>
+      ) : (data ?? []).length === 0 ? (
+        <p className="text-sm text-muted">
+          No crowd data for {selectedState ?? "this selection"} yet.
+        </p>
+      ) : nearby.length > 0 && positioned.length === 0 ? (
+        <p className="mb-6 rounded-xl bg-orange-500/10 p-3 text-sm text-orange-500">
+          {nearby.length} station{nearby.length === 1 ? "" : "s"} found, but
+          none has valid map coordinates (latitude/longitude missing or
+          0,0) - check the seeded station data.
+        </p>
+      ) : (
+      <div className="grid gap-8 xl:grid-cols-3">
 
         <div className="xl:col-span-2">
 
           <div
-            className="
-            relative
-            h-[560px]
-            overflow-hidden
-            rounded-3xl
-            border
-            border-border
-            bg-gradient-to-br
-            from-slate-950
-            via-slate-900
-            to-black
-            "
+            ref={fullscreenRef}
+            className={
+              isFullscreen
+                ? "relative h-screen w-screen overflow-hidden bg-gradient-to-br from-slate-950 via-slate-900 to-black"
+                : "relative h-[560px] overflow-hidden rounded-3xl border border-border bg-gradient-to-br from-slate-950 via-slate-900 to-black"
+            }
           >
 
-            <svg
-              className="absolute inset-0 h-full w-full"
-            >
-              <line
-                x1="12%"
-                y1="82%"
-                x2="48%"
-                y2="26%"
-                stroke="#2563eb"
-                strokeWidth="6"
-              />
+            <MapFullscreenToggle isFullscreen={isFullscreen} onToggle={toggleFullscreen} />
 
-              <line
-                x1="48%"
-                y1="26%"
-                x2="61%"
-                y2="41%"
-                stroke="#2563eb"
-                strokeWidth="6"
-              />
+            {
+}
+            <div className="absolute inset-0 select-none">
 
-              <line
-                x1="61%"
-                y1="41%"
-                x2="82%"
-                y2="71%"
-                stroke="#2563eb"
-                strokeWidth="6"
-              />
-
-              <line
-                x1="48%"
-                y1="26%"
-                x2="62%"
-                y2="14%"
-                stroke="#2563eb"
-                strokeWidth="6"
-              />
-
-              <line
-                x1="82%"
-                y1="71%"
-                x2="92%"
-                y2="82%"
-                stroke="#2563eb"
-                strokeWidth="6"
-              />
-            </svg>
-
-            {stations.map((station) => (
-              <button
-                key={station.id}
-                onClick={() => setSelected(station)}
-                className="absolute -translate-x-1/2 -translate-y-1/2"
-                style={{
-                  left: `${station.x}%`,
-                  top: `${station.y}%`,
-                }}
+              <svg
+                className="absolute inset-0 h-full w-full overflow-visible"
+                viewBox="0 0 100 100"
+                preserveAspectRatio="none"
               >
-                <div
-                  className="absolute rounded-full blur-xl opacity-50"
-                  style={{
-                    width: getSize(station.occupancy) * 2,
-                    height: getSize(station.occupancy) * 2,
-                    background: getColor(
-                      station.occupancy
-                    ),
-                    transform:
-                      "translate(-50%,-50%)",
-                    left: "50%",
-                    top: "50%",
-                  }}
-                />
+                {lineSegments.map((seg) => (
+                  <polyline
+                    key={seg.key}
+                    points={seg.points}
+                    fill="none"
+                    stroke={seg.color}
+                    strokeWidth={0.6}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    opacity={0.85}
+                    vectorEffect="non-scaling-stroke"
+                  />
+                ))}
+              </svg>
 
-                <div
-                  className="relative rounded-full border-4 border-white transition hover:scale-125"
-                  style={{
-                    width: getSize(
-                      station.occupancy
-                    ),
-                    height: getSize(
-                      station.occupancy
-                    ),
-                    background: getColor(
-                      station.occupancy
-                    ),
-                  }}
-                />
+              {positioned.map((station) => {
+                const occupancy = station.occupancy_ratio * 100;
+                const showLabel =
+                  showAllLabels || hoveredId === station.station_id || selectedId === station.station_id;
+                const isOvercrowded = occupancy >= 70;
+                return (
+                  <button
+                    key={station.station_id}
+                    onClick={() => setSelectedId(station.station_id)}
+                    onPointerEnter={() => setHoveredId(station.station_id)}
+                    onPointerLeave={() => setHoveredId((id) => (id === station.station_id ? null : id))}
+                    className="absolute -translate-x-1/2 -translate-y-1/2"
+                    style={{
+                      left: `${station.x}%`,
+                      top: `${station.y}%`,
+                    }}
+                  >
+                    <div
+                      className={`absolute rounded-full blur-xl opacity-50 ${isOvercrowded ? "animate-pulse" : ""}`}
+                      style={{
+                        width: getSize(occupancy) * 2,
+                        height: getSize(occupancy) * 2,
+                        background: getColor(occupancy),
+                        transform: "translate(-50%,-50%)",
+                        left: "50%",
+                        top: "50%",
+                      }}
+                    />
 
-                <p className="mt-3 whitespace-nowrap text-xs font-semibold text-white">
-                  {station.station}
-                </p>
-              </button>
-            ))}
+                    <div
+                      className={`relative rounded-full border-4 border-white transition hover:scale-125 ${isOvercrowded ? "animate-pulse" : ""}`}
+                      style={{
+                        width: getSize(occupancy),
+                        height: getSize(occupancy),
+                        background: getColor(occupancy),
+                      }}
+                    />
+
+                    {isOvercrowded && !showLabel && (
+                      <span className="absolute -right-1 -top-1 flex h-3 w-3">
+                        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-orange-400 opacity-75" />
+                        <span className="relative inline-flex h-3 w-3 rounded-full bg-orange-500" />
+                      </span>
+                    )}
+
+                    {showLabel && (
+                      <p className="mt-3 whitespace-nowrap rounded bg-black/70 px-1.5 py-0.5 text-xs font-semibold text-white">
+                        {station.station_name}
+                      </p>
+                    )}
+                  </button>
+                );
+              })}
+
+            </div>
+
+            {!showAllLabels && (
+              <p className="pointer-events-none absolute left-4 top-4 z-10 rounded-lg bg-black/60 px-3 py-1.5 text-xs text-white/70">
+                {positioned.length} stations - hover a dot for its name
+              </p>
+            )}
+
           </div>
 
         </div>
 
-        {/* Details */}
-
         <div>
+
+          <div className="mb-6">
+            <LiveLocationPanel />
+          </div>
 
           <div className="rounded-3xl border border-border bg-background p-6">
 
@@ -250,19 +492,19 @@ export default function CrowdHeatMap() {
                   <InfoRow
                     icon={<Users size={18} />}
                     label="Station"
-                    value={selected.station}
+                    value={selected.station_name}
                   />
 
                   <InfoRow
                     icon={<Users size={18} />}
                     label="Passengers"
-                    value={selected.passengers.toLocaleString()}
+                    value={selected.current_count.toLocaleString()}
                   />
 
                   <InfoRow
                     icon={<Activity size={18} />}
                     label="Occupancy"
-                    value={`${selected.occupancy}%`}
+                    value={`${(selected.occupancy_ratio * 100).toFixed(0)}%`}
                   />
 
                 </div>
@@ -274,7 +516,7 @@ export default function CrowdHeatMap() {
                     <span>Capacity</span>
 
                     <strong>
-                      {selected.occupancy}%
+                      {(selected.occupancy_ratio * 100).toFixed(0)}%
                     </strong>
 
                   </div>
@@ -284,10 +526,8 @@ export default function CrowdHeatMap() {
                     <div
                       className="h-full rounded-full"
                       style={{
-                        width: `${selected.occupancy}%`,
-                        background: getColor(
-                          selected.occupancy
-                        ),
+                        width: `${selected.occupancy_ratio * 100}%`,
+                        background: getColor(selected.occupancy_ratio * 100),
                       }}
                     />
 
@@ -320,8 +560,8 @@ export default function CrowdHeatMap() {
                       </h4>
 
                       <p className="mt-2 text-sm text-muted leading-7">
-                        Increase train frequency if
-                        occupancy exceeds 85%.
+                        {recommendations[0]?.detail ??
+                          "No anomalies detected for this station right now."}
                       </p>
 
                     </div>
@@ -357,8 +597,7 @@ export default function CrowdHeatMap() {
               />
 
               <p className="text-sm text-muted">
-                AI updates the heatmap every 30
-                seconds.
+                Live data from MetroFlow&apos;s crowd monitoring API.
               </p>
 
             </div>
@@ -368,6 +607,7 @@ export default function CrowdHeatMap() {
         </div>
 
       </div>
+      )}
 
     </section>
   );

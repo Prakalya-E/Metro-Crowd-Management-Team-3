@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useMemo, useState } from "react";
 import {
   Bar,
   BarChart,
@@ -11,32 +12,12 @@ import {
   YAxis,
 } from "recharts";
 
-const data = [
-  {
-    station: "Rajiv Chowk",
-    occupancy: 95,
-  },
-  {
-    station: "Kashmere Gate",
-    occupancy: 84,
-  },
-  {
-    station: "Central Sec.",
-    occupancy: 72,
-  },
-  {
-    station: "Noida 18",
-    occupancy: 61,
-  },
-  {
-    station: "Botanical",
-    occupancy: 54,
-  },
-  {
-    station: "Dwarka",
-    occupancy: 38,
-  },
-];
+import { useApiData } from "@/hooks/useApiData";
+import { useLiveSocket } from "@/hooks/useLiveSocket";
+import { useLiveSocketContext } from "@/providers/LiveSocketProvider";
+import { getCrowdDashboard } from "@/lib/api/crowd";
+import { useSelectedState } from "@/providers/StateProvider";
+import { queryKeys } from "@/lib/queryKeys";
 
 const colors = [
   "#ef4444",
@@ -47,7 +28,58 @@ const colors = [
   "#06b6d4",
 ];
 
+const TOP_N_STATIONS = 15;
+
 export default function StationOccupancyChart() {
+  const { selectedState } = useSelectedState();
+  const { isConnected } = useLiveSocketContext();
+  
+  const { data, loading } = useApiData(
+    queryKeys.crowdDashboard,
+    (signal) => getCrowdDashboard(selectedState ?? undefined, signal),
+    [selectedState],
+    isConnected ? 0 : 30000,
+  );
+
+  const [liveById, setLiveById] = useState<Record<number, { current_count: number; crowd_level: string }>>({});
+
+  useEffect(() => {
+    setLiveById({});
+  }, [data]);
+
+  useLiveSocket({
+    crowd_update: (payload) => {
+      setLiveById((prev) => {
+        const next = { ...prev };
+        for (const u of payload.updates) {
+          next[u.station_id] = {
+            current_count: u.current_count,
+            crowd_level: u.crowd_level,
+          };
+        }
+        return next;
+      });
+    },
+  });
+
+  const sortedData = useMemo(() => {
+    return (data ?? [])
+      .map((s) => {
+        const live = liveById[s.station_id];
+        const count = live ? live.current_count : s.current_count;
+        const ratio = s.capacity > 0 ? count / s.capacity : s.occupancy_ratio;
+
+        return {
+          station: s.station_name,
+          occupancy: Math.round(Math.min(ratio, 1) * 100),
+        };
+      })
+      .sort((a, b) => b.occupancy - a.occupancy);
+  }, [data, liveById]);
+
+  const chartData = sortedData.slice(0, TOP_N_STATIONS);
+  const hiddenCount = sortedData.length - chartData.length;
+
   return (
     <div
       className="
@@ -66,28 +98,37 @@ export default function StationOccupancyChart() {
 
         <p className="mt-2 text-muted">
           Live Crowd Distribution
+          {hiddenCount > 0 && (
+            <span className="ml-2 text-xs text-muted/70">
+              (Top {TOP_N_STATIONS} by occupancy - {hiddenCount} more station
+              {hiddenCount === 1 ? "" : "s"} not shown)
+            </span>
+          )}
         </p>
 
       </div>
 
+      {loading ? (
+        <p className="text-sm text-muted">Loading...</p>
+      ) : (
       <ResponsiveContainer
         width="100%"
         height={350}
       >
-        <BarChart data={data}>
+        <BarChart data={chartData}>
 
           <CartesianGrid
             strokeDasharray="3 3"
-            stroke="#374151"
+            stroke="var(--border)"
           />
 
           <XAxis
             dataKey="station"
-            stroke="#94A3B8"
+            stroke="var(--muted)"
           />
 
           <YAxis
-            stroke="#94A3B8"
+            stroke="var(--muted)"
           />
 
           <Tooltip
@@ -95,8 +136,8 @@ export default function StationOccupancyChart() {
               fill: "rgba(59,130,246,.08)",
             }}
             contentStyle={{
-              background: "#111827",
-              border: "1px solid #1f2937",
+              background: "var(--surface)",
+              border: "1px solid var(--border)",
               borderRadius: "16px",
             }}
           />
@@ -105,10 +146,10 @@ export default function StationOccupancyChart() {
             dataKey="occupancy"
             radius={[8, 8, 0, 0]}
           >
-            {data.map((entry, index) => (
+            {chartData.map((entry, index) => (
               <Cell
                 key={entry.station}
-                fill={colors[index]}
+                fill={colors[index % colors.length]}
               />
             ))}
           </Bar>
@@ -116,6 +157,7 @@ export default function StationOccupancyChart() {
         </BarChart>
 
       </ResponsiveContainer>
+      )}
 
     </div>
   );
